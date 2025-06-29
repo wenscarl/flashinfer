@@ -138,6 +138,13 @@ void trtllm_paged_attention_launcher(at::Tensor& out, at::Tensor& query,
   // the kernel is supported.
   runner_params.mChunkedAttentionSize = INT_MAX;
   runner_params.mAttentionWindowSize = INT_MAX;
+//  bool foundKernels = false;
+  auto [foundKernels, kinfo] = fmha_runner.isSupportedWithInfo(runner_params);
+  if (!foundKernels) {
+	 std::cout<<"wwwwwwwwwwwwwwwwwwwwwwwwwwww\n";
+	 std::cout << kinfo ;
+  }
+
 
   runner_params.mMultiProcessorCount = getMultiProcessorCount();
   auto const [free_memory, total_memory] = getDeviceMemoryInfo(false);
@@ -166,7 +173,7 @@ void trtllm_paged_attention_launcher(at::Tensor& out, at::Tensor& query,
     } else if (SRC_DTYPE == at::ScalarType::BFloat16) {                        \
       FN(__nv_bfloat16, Data_type::DATA_TYPE_BF16);                            \
     } else {                                                                   \
-      TORCH_CHECK(false, "Unsupported input type of kv cache: ", SRC_DTYPE);   \
+      TORCH_CHECK(false, "HHHUnsupported input type of kv cache: ", SRC_DTYPE);   \
     }                                                                          \
   } else {                                                                     \
     if (KV_DTYPE == "fp8" || KV_DTYPE == "fp8_e4m3") {                         \
@@ -175,10 +182,10 @@ void trtllm_paged_attention_launcher(at::Tensor& out, at::Tensor& query,
       } else if (SRC_DTYPE == at::ScalarType::BFloat16) {                      \
         FN(__nv_bfloat16, Data_type::DATA_TYPE_E4M3);                          \
       } else {                                                                 \
-        TORCH_CHECK(false, "Unsupported input type of kv cache: ", SRC_DTYPE); \
+        TORCH_CHECK(false, "2222Unsupported input type of kv cache: ", SRC_DTYPE); \
       }                                                                        \
     } else {                                                                   \
-      TORCH_CHECK(false, "Unsupported data type of kv cache: ", KV_DTYPE);     \
+      TORCH_CHECK(false, "33333Unsupported data type of kv cache: ", KV_DTYPE);     \
     }                                                                          \
   }
 

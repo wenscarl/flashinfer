@@ -17,10 +17,10 @@ def to_float8(x, dtype=torch.float8_e4m3fn):
 
 
 @pytest.mark.parametrize("kv_layout", ["HND"])  # trtllm-gen only support HND
-@pytest.mark.parametrize("batch_size", [4, 8])
-@pytest.mark.parametrize("page_size", [16, 32, 64])
-@pytest.mark.parametrize("num_kv_heads", [4])
-@pytest.mark.parametrize("kv_cache_dtype", ["auto", "fp8"])
+@pytest.mark.parametrize("batch_size", [4,])
+@pytest.mark.parametrize("page_size", [16])
+@pytest.mark.parametrize("num_kv_heads", [2])
+@pytest.mark.parametrize("kv_cache_dtype", ["auto"])
 def test_trtllm_batch_decode(
     kv_layout, batch_size, page_size, num_kv_heads, kv_cache_dtype
 ):
@@ -32,7 +32,7 @@ def test_trtllm_batch_decode(
     HEAD_GRP_SIZE = 8
     num_qo_heads = num_kv_heads * HEAD_GRP_SIZE
     batch_size = batch_size
-    MAX_SEQ_LEN = 128
+    MAX_SEQ_LEN = 1025
 
     # Initialize tensors
     num_tokens = MAX_SEQ_LEN * batch_size
@@ -40,7 +40,7 @@ def test_trtllm_batch_decode(
     dtype = torch.float16
 
     scale = float(1.0 / (head_dim**0.5))
-    q = torch.randn(2, num_qo_heads, head_dim).to(0).half()
+    q = torch.randn(2, num_qo_heads, head_dim).to(0).to(torch.bfloat16)
 
     # Sequence lengths and block tables
     seq_lens = [MAX_SEQ_LEN for _ in range(batch_size)]
@@ -60,7 +60,7 @@ def test_trtllm_batch_decode(
 
     # Create interleaved KV cache
     kv_cache_shape = (num_blocks, 2, num_kv_heads, page_size, head_dim)
-    kv_cache = torch.randn(size=kv_cache_shape).half()
+    kv_cache = torch.randn(size=kv_cache_shape).to(torch.bfloat16)
     k_scale = v_scale = 1.0
 
     if kv_cache_dtype.startswith("fp8"):

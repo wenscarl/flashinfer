@@ -54,8 +54,8 @@ static const struct TllmGenFmhaKernelMetaInfo {
   int mKernelType;
   int mMaxNumHeadsQPerKvInCta;
   int mTileScheduler;
-  bool mGroupsHeadsQ;
   bool mMultiCtasKvMode;
+  bool mGroupsHeadsQ;
   bool mReuseSmemKForV;
   bool m2CtaMma;
   const char* sha256;
