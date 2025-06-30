@@ -126,11 +126,13 @@ class TllmGenFmhaKernel {
     // The iteration index (used to detect a deadlock of selecting new kernels).
     int selectKernelIter = 0;
     // While loop.
+      std::cout << "0000 selectKernelParams.mSelectNewKernel: " << selectKernelParams.mSelectNewKernel << std::endl;
     while (true) {
       // Any value >= 2 should work here, but we set it larger in case that we
       // might have more complicated heuristic in the future.
       TORCH_CHECK(selectKernelIter < 8,
                   "A deadlock is detected when selecting trtllm-gen kernels.");
+      std::cout << "11111 selectKernelParams.mSelectNewKernel: " << selectKernelParams.mSelectNewKernel << std::endl;
       auto [hashId, info] = hashFromRunnerParams(params, selectKernelParams);
       auto const findMetaIter = mKernelMetaMap.find(hashId);
 
@@ -152,10 +154,12 @@ class TllmGenFmhaKernel {
       auto [maxNumCtasQ, maxNumCtasKv, numCtasX, numCtasY, numCtasZ, clusterDimX] =
           computeNumCtas(params, kernelMeta, selectKernelParams);
       // Need to select a new kernel if mSelectNewKernel is true.
+      std::cout << "BBB selectKernelParams.mSelectNewKernel: " << selectKernelParams.mSelectNewKernel << std::endl;
       if (selectKernelParams.mSelectNewKernel) {
         selectKernelIter++;
         continue;
       }
+      std::cout << "FFF selectKernelParams.mSelectNewKernel" << selectKernelParams.mSelectNewKernel << std::endl;
 
       // Prepare the kernel parameters.
       auto kernelParams =
@@ -238,153 +242,160 @@ class TllmGenFmhaKernel {
   // Compute the number of CTAs in X, Y and Z dimension and the cluster size in the X dimension.
   using CtaInfo = std::tuple<int, int, int, int, int, int>;
 
-  CtaInfo computeNumCtas(RunnerParams const& params, KernelMeta const& kernelMeta,
-                         SelectKernelParams& selectKernelParams) const {
-    bool isDsv3MinLatencyMode = params.mBatchSize == 1 && params.mMaxSeqLenQ >= 1 &&
-                                params.mMaxSeqLenQ <= 16 && params.mHeadDimQk == 576 &&
-                                params.mHeadDimV == 512;
-    // Do we need to select a new kernel ?
-    selectKernelParams.mSelectNewKernel = false;
+  CtaInfo computeNumCtas(
+        RunnerParams const& params, KernelMeta const& kernelMeta, SelectKernelParams& selectKernelParams) const
+    {
+        bool isDsv3MinLatencyMode = params.mBatchSize == 1 && params.mMaxSeqLenQ >= 1 && params.mMaxSeqLenQ <= 16
+            && params.mHeadDimQk == 576 && params.mHeadDimV == 512;
+        // Do we need to select a new kernel ?
+        selectKernelParams.mSelectNewKernel = false;
 
-    // The number of Ctas per Q sequence.
-    int numCtasPerSeqQ = (params.mMaxSeqLenQ + kernelMeta.mStepQ - 1) / kernelMeta.mStepQ;
-    // Each CTA handles one tokenQ by default for spec-decoding generation kernel, which is used to
-    // emulate causal masking (like MTP or Eagle3). Note this will be changed later when the
-    // high-throughput spec-decoding generation kernels are integrated.
-    if (params.mMaxSeqLenQ > 1 && !isContextKernel(params.mKernelType)) {
-      numCtasPerSeqQ = params.mMaxSeqLenQ;
-    }
-    // Compute the grid dimension Y.
-    int numHeadsPerCta = kernelMeta.mGroupsHeadsQ
-                             ? std::min(params.mNumHeadsQPerKv, kernelMeta.mMaxNumHeadsQPerKvInCta)
-                             : 1;
-    int numCtasForAllHeadsQ = params.mNumHeadsQ / numHeadsPerCta;
-    TORCH_CHECK(numHeadsPerCta * numCtasForAllHeadsQ == params.mNumHeadsQ,
-                "The numHeadsQ/numHeadsKv is not supported.");
-    // Take the number of headDim CTAs.
-    TORCH_CHECK(kernelMeta.mHeadDimV % selectKernelParams.mHeadDimPerCtaV == 0,
-                "The headDimPerCtaV is not supported.");
-    int numCtasPerHeadDim = kernelMeta.mHeadDimV / selectKernelParams.mHeadDimPerCtaV;
-    // Compute the current numCtasX.
-    int numCtasX = numCtasPerSeqQ;
-    // Update the numCtasY.
-    int numCtasY = numCtasForAllHeadsQ * numCtasPerHeadDim;
-    // Compute the grid dimension Z.
-    int numCtasZ = params.mBatchSize;
-    // MTP kernels use different blockY to process MTP tokens.
-    if (isMlaGenKernel(params) && params.mMaxSeqLenQ > 1) {
-      numCtasZ *= params.mMaxSeqLenQ;
-      numCtasPerSeqQ = 1;
-    }
-    // The 2CtaMma kernels will use 2 Ctas in the x dimension (only used by MLA
-    // generation kernels) for heads, so numCtasPerHeadDim and
-    // numCtasForAllHeadsQ will be handled by the 2Ctas in the x dimension.
-    if (isMlaGenKernel(params) && selectKernelParams.mUses2CtaMma) {
-      TORCH_CHECK(numCtasForAllHeadsQ == 2 && numCtasPerHeadDim == 2,
-                  "Internal error: numCtasPerHeadDim should be 2.");
-      numCtasX *= 2;
-      numCtasY /= (numCtasForAllHeadsQ * numCtasPerHeadDim);
-    }
-
-    // First split the seqLenKv into multiple CTAs if the utilization is not
-    // full. The number of Ctas per KV sequence.
-    int numCtasPerSeqKv = 1;
-    // Consider the multiCtasKvMode for better GPU utilization.
-    if (isMultiCtasKvEnabled(selectKernelParams.mMultiCtasKvMode)) {
-      // The maximum attention window (the maximum number of tokensKv that will be attended to).
-      int maxAttentionWindow{params.mMaxSeqLenKv};
-      // Some of the tilesKv will be skipped if the sliding window attention or chunked attention is
-      // used.
-      if (isSlidingOrChunkedCausalMask(selectKernelParams.mMaskType)) {
-        if (params.mMaxSeqLenKv > params.mAttentionWindowSize) {
-          // Consider that the first tileKv might contain tokensKv that is out of the attention
-          // window.
-          maxAttentionWindow =
-              std::min(params.mMaxSeqLenKv, params.mAttentionWindowSize + kernelMeta.mStepKv - 1);
-        } else {
-          maxAttentionWindow = std::min(params.mMaxSeqLenKv, params.mChunkedAttentionSize);
+        // The number of Ctas per Q sequence.
+        int numCtasPerSeqQ = (params.mMaxSeqLenQ + kernelMeta.mStepQ - 1) / kernelMeta.mStepQ;
+        // Each CTA handles one tokenQ by default for spec-decoding generation kernel, which is used to emulate causal
+        // masking (like MTP or Eagle3). Note this will be changed later when the high-throughput spec-decoding
+        // generation kernels are integrated.
+        if (params.mMaxSeqLenQ > 1 && !isContextKernel(params.mKernelType))
+        {
+            numCtasPerSeqQ = params.mMaxSeqLenQ;
         }
-      }
 
-      // The maximum number Ctas per Kv sequence, which makes sure that each
-      // CtaKv has work to do.
-      int const maxNumCtasPerSeqKv =
-          (maxAttentionWindow + kernelMeta.mStepKv - 1) / kernelMeta.mStepKv;
-      // Compute numCtasPerSeqKv.
-      numCtasPerSeqKv = std::min(
-          maxNumCtasPerSeqKv,
-          std::max(1, int32_t(params.mMultiProcessorCount / (numCtasX * numCtasY * numCtasZ))));
-      // Update the numCtasX.
-      numCtasX *= numCtasPerSeqKv;
-      // The current total number of CTAs.
-      int totalNumCtas = numCtasX * numCtasZ * numCtasY;
-      // Disable the multiCtasKvMode if there is only one CtaKv.
-      if (numCtasPerSeqKv <= 1) {
-        selectKernelParams.mMultiCtasKvMode = MultiCtasKvMode::Disabled;
-        // Enable the persistent scheduler for better performance.
-        selectKernelParams.mTileScheduler = TileScheduler::Persistent;
-        // Need to select a different kernel.
-        selectKernelParams.mSelectNewKernel = true;
-      } else if (totalNumCtas < params.mMultiProcessorCount && isMlaGenKernel(params) &&
-                 selectKernelParams.mTileSizeKv == 128 && getEnvUseTileSizeKv64ForTrtllmGen()) {
-        // Use smaller tileSizeKv to fully utilize the SMs.
-        selectKernelParams.mTileSizeKv = 64;
-        // Need to select a different kernel.
-        selectKernelParams.mSelectNewKernel = true;
-      }
-      // Enable the CgaSmemReduction if the numCtasPerSeqKv <= 16 as the maximum cluster dimension
-      // is 16. Only the swapsMmaAbForGeneration kernel supports the CgaSmemReduction for now.
-      if (!isDsv3MinLatencyMode && numCtasPerSeqKv > 1 && numCtasPerSeqKv <= 16 &&
-          isSwapsMmaAbForGenerationKernel(selectKernelParams.mKernelType) &&
-          isGmemReduction(selectKernelParams.mMultiCtasKvMode) &&
-          !selectKernelParams.mForceGmemReduction) {
-        selectKernelParams.mMultiCtasKvMode = MultiCtasKvMode::CgaSmemReduction;
-        // Need to select a different kernel.
-        selectKernelParams.mSelectNewKernel = true;
-      }
-      // Add the debug info when multiCtasKvMode is enabled.
-      if (numCtasPerSeqKv > 1) {
-        // TODO(shuw)
-        IKL_LOG_DEBUG(
-            "TRTLLM-Gen launch info: multiCtasKvMode is enabled with "
-            "tileSizeKv = %d, numCtasPerSeqKv = %d, "
-            "numCtasPerSeqQ = "
-            "%d, numCtasY = %d, numCtasZ = %d",
-            selectKernelParams.mTileSizeKv, numCtasPerSeqKv, numCtasPerSeqQ, numCtasY, numCtasZ);
-      }
+        // Compute the grid dimension Y.
+        int numHeadsPerCta
+            = kernelMeta.mGroupsHeadsQ ? std::min(params.mNumHeadsQPerKv, kernelMeta.mMaxNumHeadsQPerKvInCta) : 1;
+        int numCtasForAllHeadsQ = params.mNumHeadsQ / numHeadsPerCta;
+        TORCH_CHECK(
+            numHeadsPerCta * numCtasForAllHeadsQ == params.mNumHeadsQ, "The numHeadsQ/numHeadsKv is not supported.");
+        // Take the number of headDim CTAs.
+        TORCH_CHECK(
+            kernelMeta.mHeadDimV % selectKernelParams.mHeadDimPerCtaV == 0, "The headDimPerCtaV is not supported.");
+        int numCtasPerHeadDim = kernelMeta.mHeadDimV / selectKernelParams.mHeadDimPerCtaV;
+        // Compute the current numCtasX.
+        int numCtasX = numCtasPerSeqQ;
+        // Update the numCtasY.
+        int numCtasY = numCtasForAllHeadsQ * numCtasPerHeadDim;
+        // Compute the grid dimension Z.
+        int numCtasZ = params.mBatchSize;
+        // The 2CtaMma kernels will use 2 Ctas in the x dimension (only used by MLA generation kernels) for heads,
+        // so numCtasPerHeadDim and numCtasForAllHeadsQ will be handled by the 2Ctas in the x dimension.
+        if (isMlaGenKernel(params) && selectKernelParams.mUses2CtaMma)
+        {
+            TORCH_CHECK(
+                numCtasForAllHeadsQ == 2 && numCtasPerHeadDim == 2, "Internal error: numCtasPerHeadDim should be 2.");
+            numCtasX *= 2;
+            numCtasY /= (numCtasForAllHeadsQ * numCtasPerHeadDim);
+        }
+
+        // First split the seqLenKv into multiple CTAs if the utilization is not full.
+        // The number of Ctas per KV sequence.
+        int numCtasPerSeqKv = 1;
+        // Consider the multiCtasKvMode for better GPU utilization.
+        if (isMultiCtasKvEnabled(selectKernelParams.mMultiCtasKvMode))
+        {
+            // The maximum attention window (the maximum number of tokensKv that will be attended to).
+            int maxAttentionWindow{params.mMaxSeqLenKv};
+            // Some of the tilesKv will be skipped if the sliding window attention or chunked attention is used.
+            if (isSlidingOrChunkedCausalMask(selectKernelParams.mMaskType))
+            {
+                if (params.mMaxSeqLenKv > params.mAttentionWindowSize)
+                {
+                    // Consider that the first tileKv might contain tokensKv that is out of the attention window.
+                    maxAttentionWindow
+                        = std::min(params.mMaxSeqLenKv, params.mAttentionWindowSize + kernelMeta.mStepKv - 1);
+                }
+                else
+                {
+                    maxAttentionWindow = std::min(params.mMaxSeqLenKv, params.mChunkedAttentionSize);
+                }
+            }
+
+            // The maximum number Ctas per Kv sequence, which makes sure that each CtaKv has work to do.
+            int const maxNumCtasPerSeqKv = (maxAttentionWindow + kernelMeta.mStepKv - 1) / kernelMeta.mStepKv;
+            // Compute numCtasPerSeqKv.
+            numCtasPerSeqKv = std::min(maxNumCtasPerSeqKv,
+                std::max(1, int32_t(params.mMultiProcessorCount / (numCtasX * numCtasY * numCtasZ))));
+            // Update the numCtasX.
+            numCtasX *= numCtasPerSeqKv;
+            // The current total number of CTAs.
+            int totalNumCtas = numCtasX * numCtasZ * numCtasY;
+            // Disable the multiCtasKvMode if there is only one CtaKv.
+            if (numCtasPerSeqKv <= 1)
+            {
+                selectKernelParams.mMultiCtasKvMode = MultiCtasKvMode::Disabled;
+                // Enable the persistent scheduler for better performance.
+                selectKernelParams.mTileScheduler = TileScheduler::Persistent;
+                // Need to select a different kernel.
+                selectKernelParams.mSelectNewKernel = true;
+            }
+            else if (totalNumCtas < params.mMultiProcessorCount && isMlaGenKernel(params)
+                && selectKernelParams.mTileSizeKv == 128 && getEnvUseTileSizeKv64ForTrtllmGen())
+            {
+                // Use smaller tileSizeKv to fully utilize the SMs.
+                selectKernelParams.mTileSizeKv = 64;
+                // Need to select a different kernel.
+		std::cout <<"ffffffiiiiiiiiiirrrrrrrrrrr\n";
+                selectKernelParams.mSelectNewKernel = true;
+            }
+
+            // Enable the CgaSmemReduction if the numCtasPerSeqKv <= 16 as the maximum cluster dimension is 16.
+            // Only the swapsMmaAbForGeneration kernel supports the CgaSmemReduction for now.
+            if (!isDsv3MinLatencyMode && numCtasPerSeqKv > 1 && numCtasPerSeqKv <= 16
+                && isSwapsMmaAbForGenerationKernel(selectKernelParams.mKernelType)
+                && isGmemReduction(selectKernelParams.mMultiCtasKvMode) && !selectKernelParams.mForceGmemReduction)
+            {
+                selectKernelParams.mMultiCtasKvMode = MultiCtasKvMode::CgaSmemReduction;
+                // Need to select a different kernel.
+		std::cout << "sssssseeeeeeeeeeeeccccccccccccc\n";
+                selectKernelParams.mSelectNewKernel = true;
+            }
+
+            // Add the debug info when multiCtasKvMode is enabled.
+            if (numCtasPerSeqKv > 1)
+            {
+                IKL_LOG_DEBUG(
+                    "TRTLLM-Gen launch info: multiCtasKvMode is enabled with tileSizeKv = %d, numCtasPerSeqKv = %d, "
+                    "numCtasPerSeqQ = "
+                    "%d, numCtasY = %d, numCtasZ = %d",
+                    selectKernelParams.mTileSizeKv, numCtasPerSeqKv, numCtasPerSeqQ, numCtasY, numCtasZ);
+            }
+        }
+
+        // The cluster size in the X dimension.
+        int clusterDimX = selectKernelParams.mUses2CtaMma ? 2 : 1;
+        if (isCgaSmemReduction(selectKernelParams.mMultiCtasKvMode))
+        {
+            // Note 2CtaMma and CgaSmemReduction cannot be used together currently.
+            clusterDimX *= numCtasPerSeqKv;
+        }
+
+        // Compute the current number of CTAs in total.
+        int totalNumCtas = numCtasX * numCtasZ * numCtasY;
+
+        // Then split the headDimV into multiple CTAs if there are still unused SMs.
+        if (isMlaGenKernel(params) && !selectKernelParams.mReuseSmemKForV && !selectKernelParams.mSelectNewKernel
+            && !selectKernelParams.mUses2CtaMma)
+        {
+            // Split the headDimV into multiple CTAs if the utilization is not full.
+            // It doesn't work with reuseSmemKForV currently.
+            // TODO: find better heuristic of splitting headDimV across multiple CTAs.
+
+            int corrFactor = isDsv3MinLatencyMode ? 1 : 2;
+            if (selectKernelParams.mHeadDimPerCtaV == 512 && totalNumCtas * corrFactor <= params.mMultiProcessorCount)
+            {
+                // Use smaller headDimPerCtaV to fully utilize the SMs.
+                selectKernelParams.mHeadDimPerCtaV
+                    = totalNumCtas * 2 * corrFactor <= params.mMultiProcessorCount ? 128 : 256;
+                // Need to select a different kernel.
+		std::cout << "tttttthhhhhhhhhhhhhhhhrrrrrrrrrrrrr\n";
+                selectKernelParams.mSelectNewKernel = true;
+            }
+        }
+
+        // Return the number of CTAs for X, Y and Z dimension and the cluster size in the X dimension.
+        return std::make_tuple(numCtasPerSeqQ, numCtasPerSeqKv, numCtasX, numCtasY, numCtasZ, clusterDimX);
     }
-    // The cluster size in the X dimension.
-    int clusterDimX = selectKernelParams.mUses2CtaMma ? 2 : 1;
-    if (isCgaSmemReduction(selectKernelParams.mMultiCtasKvMode)) {
-      // Note 2CtaMma and CgaSmemReduction cannot be used together currently.
-      clusterDimX *= numCtasPerSeqKv;
-    }
 
-    // Compute the current number of CTAs in total.
-    int totalNumCtas = numCtasX * numCtasZ * numCtasY;
 
-    // Then split the headDimV into multiple CTAs if there are still unused SMs.
-    if (isMlaGenKernel(params) && !selectKernelParams.mReuseSmemKForV &&
-        !selectKernelParams.mSelectNewKernel && !selectKernelParams.mUses2CtaMma) {
-      // Split the headDimV into multiple CTAs if the utilization is not full.
-      // It doesn't work with reuseSmemKForV currently.
-      // TODO: find better heuristic of splitting headDimV across multiple CTAs.
-
-      int corrFactor = isDsv3MinLatencyMode ? 1 : 2;
-      if (selectKernelParams.mHeadDimPerCtaV == 512 &&
-          totalNumCtas * corrFactor <= params.mMultiProcessorCount) {
-        // Use smaller headDimPerCtaV to fully utilize the SMs.
-        selectKernelParams.mHeadDimPerCtaV =
-            totalNumCtas * 2 * corrFactor <= params.mMultiProcessorCount ? 128 : 256;
-        // Need to select a different kernel.
-        selectKernelParams.mSelectNewKernel = true;
-      }
-    }
-
-    // Return the number of CTAs for X, Y and Z dimension and the cluster size in the X dimension.
-    return std::make_tuple(numCtasPerSeqQ, numCtasPerSeqKv, numCtasX, numCtasY, numCtasZ,
-                           clusterDimX);
-  }
   // Compute the seqLenPerCtaKv for selecting the MLA generation kernel.
   int computeSeqLenPerCtaKv(RunnerParams const& params) const {
     // The maximum number Ctas per Kv sequence, which makes sure that each CtaKv has work to do.
