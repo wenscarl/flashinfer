@@ -17,7 +17,7 @@ def to_float8(x, dtype=torch.float8_e4m3fn):
 
 
 @pytest.mark.parametrize("kv_layout", ["HND"])  # trtllm-gen only support HND
-@pytest.mark.parametrize("batch_size", [4,])
+@pytest.mark.parametrize("batch_size", [256,])
 @pytest.mark.parametrize("page_size", [16])
 @pytest.mark.parametrize("num_kv_heads", [2])
 @pytest.mark.parametrize("kv_cache_dtype", ["auto"])

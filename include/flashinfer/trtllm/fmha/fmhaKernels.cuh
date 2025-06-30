@@ -521,6 +521,7 @@ class TllmGenFmhaKernel {
           std::string("8255191a723f8287f13efd987c1a8bc087db429c/fmha/trtllm-gen/") +
           kernelMeta.mFuncName;
       std::string cubin = getCubin(cubin_path, kernelMeta.sha256);
+      //std::cout <<"xxxxxxxxxxx:" << cubin << std::endl;
       if (cubin.empty()) {
         throw std::runtime_error("Failed to load cubin for " + kernelName);
       }
