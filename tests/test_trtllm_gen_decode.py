@@ -17,12 +17,13 @@ def to_float8(x, dtype=torch.float8_e4m3fn):
 
 
 @pytest.mark.parametrize("kv_layout", ["HND"])  # trtllm-gen only support HND
-@pytest.mark.parametrize("batch_size", [256,])
-@pytest.mark.parametrize("page_size", [16])
-@pytest.mark.parametrize("num_kv_heads", [2])
-@pytest.mark.parametrize("kv_cache_dtype", ["auto"])
+@pytest.mark.parametrize("batch_size", [4, 8, 256])
+@pytest.mark.parametrize("page_size", [16, 32, 64])
+@pytest.mark.parametrize("num_kv_heads", [2, 4])
+@pytest.mark.parametrize("q_dtype", ["bf16", "half"])
+@pytest.mark.parametrize("kv_cache_dtype", ["fp8", "auto"])
 def test_trtllm_batch_decode(
-    kv_layout, batch_size, page_size, num_kv_heads, kv_cache_dtype
+    kv_layout, batch_size, page_size, num_kv_heads, q_dtype, kv_cache_dtype
 ):
     # Set up test parameters
     seed = 0
@@ -32,15 +33,15 @@ def test_trtllm_batch_decode(
     HEAD_GRP_SIZE = 8
     num_qo_heads = num_kv_heads * HEAD_GRP_SIZE
     batch_size = batch_size
-    MAX_SEQ_LEN = 1025
+    MAX_SEQ_LEN = 128
 
     # Initialize tensors
     num_tokens = MAX_SEQ_LEN * batch_size
     num_blocks = num_tokens // page_size
-    dtype = torch.float16
+    dtype = torch.float16 if q_dtype == "half" else torch.bfloat16
 
     scale = float(1.0 / (head_dim**0.5))
-    q = torch.randn(2, num_qo_heads, head_dim).to(0).to(torch.bfloat16)
+    q = torch.randn(2, num_qo_heads, head_dim).to(0).to(dtype)
 
     # Sequence lengths and block tables
     seq_lens = [MAX_SEQ_LEN for _ in range(batch_size)]
@@ -60,7 +61,7 @@ def test_trtllm_batch_decode(
 
     # Create interleaved KV cache
     kv_cache_shape = (num_blocks, 2, num_kv_heads, page_size, head_dim)
-    kv_cache = torch.randn(size=kv_cache_shape).to(torch.bfloat16)
+    kv_cache = torch.randn(size=kv_cache_shape).to(dtype)
     k_scale = v_scale = 1.0
 
     if kv_cache_dtype.startswith("fp8"):
@@ -100,6 +101,11 @@ def test_trtllm_batch_decode(
         torch.full((batch_size,), page_size, device=device).int().to(device)
     )
 
+    if kv_cache_dtype == "auto":
+        kv_compute_dtype = dtype
+    elif kv_cache_dtype == "fp8":
+        kv_compute_dtype = torch.float8_e4m3fn
+
     wrapper.plan(
         kv_indptr,
         kv_indices,
@@ -109,8 +115,8 @@ def test_trtllm_batch_decode(
         head_dim,
         page_size,
         pos_encoding_mode="NONE",
-        data_type=torch.float16 if kv_cache_dtype == "auto" else torch.float8_e4m3fn,
-        q_data_type=torch.float16,
+        data_type=kv_compute_dtype,
+        q_data_type=dtype,
     )
 
     output_ref = wrapper.run(q.contiguous(), kv_cache)
