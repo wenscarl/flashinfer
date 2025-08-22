@@ -13,11 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # Code imported from TensorRT-LLM/tensorrt_llm/_mnnvl_utils.py
+from abc import ABC, abstractmethod
 import ctypes
 import logging
 import os
 import platform
 import sys
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -220,6 +222,49 @@ else:
         def __getattr__(self, name):
             return getattr(self._comm, name)
 
+    class CommBackend(ABC):
+        """Abstract communication backend interface"""
+        @abstractmethod
+        def Get_rank(self) -> int: ...
+        
+        @abstractmethod
+        def Get_size(self) -> int: ...
+        
+        @abstractmethod
+        def allgather(self, data: int) -> List[int]: ...
+
+        @abstractmethod
+        def allgather_bytes(self, data): ...
+        
+        @abstractmethod
+        def Split(self, color: int, key: int) -> 'CommBackend': ...
+    class LegacyMPIBackend(CommBackend):
+        """Adapter for the original MpiComm singleton pattern"""
+        def __init__(self):
+            self._mpicomm = MpiComm()
+        
+        def Get_rank(self) -> int:
+            return self._mpicomm.Get_rank()
+        
+        def Get_size(self) -> int:
+            return self._mpicomm.Get_size()
+        
+        def allgather(self, data: int) -> List[int]:
+            return self._mpicomm.allgather(data)
+        
+        def allgather_bytes(self, data):
+            return self._mpicomm.allgather(data)
+        
+        def Split(self, color: int, key: int) -> CommBackend:
+            # Original split logic
+            new_comm = self._mpicomm.Split(color, key)
+            return LegacyMPIBackend()  # Returns new adapter
+    @dataclass
+    class MnnvlConfig:
+        """Configuration for MNNVL memory management"""
+        comm_backend: Optional[CommBackend] = None
+        allocation_granularity: int = 0
+        fabric_page_size: int = 1 << 29  # 512MB
     class MnnvlMemory:  # type: ignore[no-redef]
         initialized: bool = False
 
@@ -254,6 +299,7 @@ else:
 
         def as_torch_strided_tensor(self, dtype):
             num_segments = MnnvlMemory.comm.Get_size()
+            # print(f"as_torch_strided_tensor: num_segments:{num_segments}")
             return pack_strided_memory(
                 self.ptr,
                 self.segment_size,
@@ -274,6 +320,18 @@ else:
                 except pynvml.NVMLError_Uninitialized:
                     pynvml.nvmlInit()
                 MnnvlMemory.initialized = True
+
+        @staticmethod
+        def set_comm(mapping: Mapping, config: MnnvlConfig = None):
+            # print("set_comm"*10)
+            # print(f"config:{config}, tp_rank:{mapping.tp_rank}")
+            MnnvlMemory._config = config or MnnvlConfig(comm_backend=LegacyMPIBackend())
+            comm0 = config.comm_backend
+            comm = comm0.Split(
+                mapping.pp_rank * mapping.cp_size + mapping.cp_rank, mapping.tp_rank
+            )
+            MnnvlMemory.comm = comm
+
 
         @staticmethod
         def get_comm(mapping: Mapping):
@@ -337,6 +395,7 @@ else:
 
         @staticmethod
         def open_mnnvl_memory(mapping: Mapping, size: int):
+            # print(f"open_mnnvl_memory: size {size}, mapping: {mapping}")
             dev = checkCudaErrors(cuda.cuCtxGetDevice())
             dev_id = int(dev)
             if MnnvlMemory.dev_id is None:
@@ -377,7 +436,9 @@ else:
                     0,
                 )
             )
-            all_handles_data = comm.allgather(exported_fabric_handle.data)
+            # TODO(shuw): add branch which to use
+            # all_handles_data = comm.allgather(exported_fabric_handle.data)
+            all_handles_data = comm.allgather_bytes(exported_fabric_handle.data)
             # all_handles_data like b'\x00\x00\x00 \x00\x00\x00\x00\x8f\xec\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\t\x00\x00\x00\x00\x00\x1d\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'  # noqa: E501
             # can use buf = memoryview(data) to import if using plain buffer for data.
 
@@ -433,7 +494,9 @@ else:
             )
 
             MnnvlMemory.current_mem_offset += aligned_size
+            # print("end of open_mnnvl_memory", "dddd"*100)
             return ptr, stride
+
 
         @staticmethod
         def close_mnnvl_memory(ptr: int):

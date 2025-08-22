@@ -172,7 +172,10 @@ void moeCommOp(at::Tensor input, at::Tensor sendRankCumSum, at::Tensor sendIndic
               "input and output must have the same second dimension");
   TORCH_CHECK(sendRankCumSum.size(0) == epSize, "sendRankCumSum must have epSize elements");
   TORCH_CHECK(recvRankCumSum.size(0) == epSize, "recvRankCumSum must have epSize elements");
-  TORCH_CHECK(allWorkspaces.size(0) == epSize, "allWorkspaces must have epSize elements");
+  std::ostringstream oss;
+  oss << "allWorkspaces must have epSize elements, actual: " 
+      << allWorkspaces.size(0) << " vs expected: " << epSize;
+  TORCH_CHECK(allWorkspaces.size(0) == epSize, oss.str());
 
   TORCH_CHECK(epRank >= 0 && epRank < epSize, "epRank must be in the range [0, epSize)");
 

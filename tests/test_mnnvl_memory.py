@@ -50,6 +50,7 @@ class TestMnnvlMemory:
         )
         torch.cuda.set_device(self.local_rank)
         MnnvlMemory.initialize()
+        print(f"At setup: {self.world_size}, {self.rank}, {self.local_world_size}, {self.world_size}")
         self.mapping = Mapping(
             self.world_size, self.rank, self.local_world_size, tp_size=self.world_size
         )
@@ -254,7 +255,7 @@ class TestMnnvlMemory:
         alltoall_workspace = MnnvlMoe.get_moe_workspaces(self.mapping)
 
         self.comm.Barrier()
-
+        print(f"before a2av: {input_tensors_all_ranks[self.rank].shape} and {input_tensor.shape}")
         output = MnnvlMoe.mnnvl_moe_alltoallv(
             input_tensors_all_ranks[self.rank],
             alltoall_info,
@@ -262,9 +263,10 @@ class TestMnnvlMemory:
             self.rank,
             self.world_size,
         )
+        print(f"after a2av: {output.shape}")
 
         self.comm.Barrier()
-
+        print("xxxxxx"*100)
         torch.testing.assert_close(
             output, ref_output_tensors_all_ranks[self.rank], atol=1e-5, rtol=1e-5
         )
