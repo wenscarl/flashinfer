@@ -193,7 +193,7 @@ def get_comm_alltoall_module():
         ep_size: int,
     ) -> int:
         return module.get_moe_prepare_workspace_size_per_rank(ep_size)
-    
+
     @register_custom_op(
         "flashinfer::moe_prepare",
         mutates_args=[],
@@ -209,7 +209,16 @@ def get_comm_alltoall_module():
         expert_count: int,
         slot_count: int,
         top_k: int,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
         return module.moe_prepare(
             experts_ids,
             scales,
@@ -319,10 +328,12 @@ def get_moe_commworkspace_size_per_rank(
 ) -> int:
     return get_comm_alltoall_module().get_moe_commworkspace_size_per_rank(ep_size)
 
+
 def get_moe_prepare_workspace_size_per_rank(
     ep_size: int,
 ) -> int:
     return get_comm_alltoall_module().get_moe_prepare_workspace_size_per_rank(ep_size)
+
 
 def moe_prepare(
     experts_ids: torch.Tensor,
@@ -335,7 +346,16 @@ def moe_prepare(
     expert_count: int,
     slot_count: int,
     top_k: int,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
     return get_comm_alltoall_module().moe_prepare(
         experts_ids,
         scales,
@@ -348,6 +368,7 @@ def moe_prepare(
         slot_count,
         top_k,
     )
+
 
 @dataclass
 class MoEAlltoallInfo:
@@ -455,20 +476,12 @@ class MnnvlMoe:
             local_token_allocation_count,
         )
 
-        return alltoall_info, prepared_local_experts, prepared_local_scales, gathered_expert_statics
-
-    @staticmethod
-    def mnnvl_moe_expert_static_allgather(
-        expert_ids: torch.Tensor,
-        workspace: torch.Tensor,
-        ep_rank: int,
-        ep_size: int,
-        expert_count: int,
-    ):
-        gathered_expert_ids = torch.ops.trtllm.mnnvl_moe_expert_static_allgather(
-            expert_ids, workspace, ep_rank, ep_size, expert_count
+        return (
+            alltoall_info,
+            prepared_local_experts,
+            prepared_local_scales,
+            gathered_expert_statics,
         )
-        return gathered_expert_ids
 
     @staticmethod
     def mnnvl_moe_alltoallv_prepare(
