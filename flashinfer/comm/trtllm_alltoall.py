@@ -26,7 +26,7 @@ from ..jit import env as jit_env
 from ..jit import gen_jit_spec
 from ..utils import register_custom_op
 from .mapping import Mapping
-from .mnnvl import MnnvlMemory
+from .mnnvl import (MnnvlMemory, MnnvlConfig)
 
 
 def gen_comm_alltoall_module() -> JitSpec:
@@ -389,13 +389,16 @@ class MnnvlMoe:
     moe_mapping: Mapping = None
 
     @staticmethod
-    def get_moe_workspaces(mapping: Mapping):
+    def get_moe_workspaces(mapping: Mapping, config: Optional[MnnvlConfig] = None):
         if MnnvlMoe.moe_workspace is not None:
             assert mapping == MnnvlMoe.moe_mapping, "only one moe mapping supported now"
             return MnnvlMoe.moe_workspace_tensor
 
         MnnvlMoe.moe_mapping = mapping
         workspace_size_per_rank = get_moe_commworkspace_size_per_rank(mapping.tp_size)
+        if config:
+            MnnvlMemory.set_comm(mapping, config)
+        MnnvlMemory.initialize()
         MnnvlMoe.moe_workspace = MnnvlMemory(mapping, workspace_size_per_rank)
         MnnvlMoe.moe_workspace_tensor = MnnvlMoe.moe_workspace.as_torch_strided_tensor(
             torch.uint64
@@ -403,13 +406,16 @@ class MnnvlMoe:
         return MnnvlMoe.moe_workspace_tensor
 
     @staticmethod
-    def get_moe_prepare_workspace(mapping: Mapping):
+    def get_moe_prepare_workspace(mapping: Mapping, config: Optional[MnnvlConfig] = None):
         if MnnvlMoe.moe_prepare_workspace_tensor is not None:
             assert mapping == MnnvlMoe.moe_mapping, "only one moe mapping supported now"
             return MnnvlMoe.moe_prepare_workspace_tensor
         workspace_size_per_rank = get_moe_prepare_workspace_size_per_rank(
             mapping.tp_size
         )
+        if config:
+            MnnvlMemory.set_comm(mapping, config)
+        MnnvlMemory.initialize()
         MnnvlMoe.moe_prepare_workspace = MnnvlMemory(mapping, workspace_size_per_rank)
         MnnvlMoe.moe_prepare_workspace_tensor = (
             MnnvlMoe.moe_prepare_workspace.as_torch_strided_tensor(torch.uint64)
