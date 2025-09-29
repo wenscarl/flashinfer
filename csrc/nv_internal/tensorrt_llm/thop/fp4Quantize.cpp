@@ -72,7 +72,8 @@ void fp4_quantize(Tensor self, Optional<Tensor> const& globalScale, Tensor value
   tensorrt_llm::kernels::invokeFP4Quantization<T, SF_VEC_SIZE>(                                  \
       1, m, k, reinterpret_cast<T*>(self->data), globalScalePtr,                                 \
       reinterpret_cast<int64_t*>(valueE2M1->data), reinterpret_cast<int32_t*>(scaleFP8SF->data), \
-      sfUseUE8M0, layout, mMultiProcessorCount, enable_pdl, get_stream(self->device));
+      sfUseUE8M0, layout, mMultiProcessorCount, enable_pdl, /*mask=*/nullptr,                    \
+      get_stream(self->device));
 
   if (sfUseUE8M0) {
     if (self->dtype == dl_float16) {
@@ -130,9 +131,10 @@ void fp4_quantize(Tensor self, Optional<Tensor> const& globalScale, Tensor value
 // self_fp4: [B, M, K / 2], FLOAT4_E2M1X2
 // self_block_scale_factors:
 //   [B, ceil(M / 128) * 128 * ceil(K / sfVecSize / 4) * 4], SF_DTYPE (UE4M3 or UE8M0)
-void fp4_batched_quantize(Tensor self, Tensor globalScale, Tensor valueE2M1, Tensor scaleFP8SF,
+void fp4_batched_quantize(Tensor self, std::optional<Tensor> const& mask, Tensor globalScale, Tensor valueE2M1, Tensor scaleFP8SF,
                           int64_t sfVecSize, bool sfUseUE8M0) {
   CHECK_CUDA(self);
+  CHECK_TH_CUDA(self);
   CHECK_CONTIGUOUS(self);
   auto fp32_dtype = DLDataType{kDLFloat, 32, 1};
   CHECK_INPUT_TYPE(globalScale, fp32_dtype);
@@ -148,6 +150,12 @@ void fp4_batched_quantize(Tensor self, Tensor globalScale, Tensor valueE2M1, Ten
   int64_t k = inputShape[2];
 
   TVM_FFI_ICHECK_EQ(k % sfVecSize, 0);
+  bool use_mask = mask.has_value();
+  if (use_mask) {
+    auto const& mask_rank = mask.value().sizes().size();
+    TVM_FFI_ICHECK_EQ(mask_rank, 1) << "Mask should be 1D tensor.";
+    TVM_FFI_ICHECK_EQ(mask.value().sizes()[0], b);
+  }
 
   std::vector<int64_t> outputShape(inputShape.begin(), inputShape.end());
   outputShape[rank - 1] = k / 2;
@@ -155,11 +163,13 @@ void fp4_batched_quantize(Tensor self, Tensor globalScale, Tensor valueE2M1, Ten
   const thread_local int mMultiProcessorCount = tensorrt_llm::common::getMultiProcessorCount();
   auto layout = tensorrt_llm::QuantizationSFLayout::SWIZZLED_128x4;
 
-#define LAUNCH_FP4_QUANTIZE_KERNEL(T, SF_VEC_SIZE)                                               \
-  tensorrt_llm::kernels::invokeFP4Quantization<T, SF_VEC_SIZE>(                                  \
-      b, m, k, reinterpret_cast<T*>(self->data), static_cast<float*>(globalScale->data),         \
-      reinterpret_cast<int64_t*>(valueE2M1->data), reinterpret_cast<int32_t*>(scaleFP8SF->data), \
-      sfUseUE8M0, layout, mMultiProcessorCount, get_stream(self->device));
+#define LAUNCH_FP4_QUANTIZE_KERNEL(T, SF_VEC_SIZE)                                                 \
+  tensorrt_llm::kernels::invokeFP4Quantization<T, SF_VEC_SIZE>(                                    \
+      b, m, k, reinterpret_cast<T*>(self->data), static_cast<float*>(globalScale->data),           \
+      reinterpret_cast<int64_t*>(valueE2M1->data), reinterpret_cast<int32_t*>(scaleFP8SF->data),   \
+      sfUseUE8M0, layout, mMultiProcessorCount, \
+      use_mask ? mask.value().data_ptr<int32_t>() : nullptr,                                       \
+      get_stream(self->device));
 
   if (self->dtype == dl_float16) {
     LAUNCH_FP4_QUANTIZE_KERNEL(half, 16)
@@ -185,5 +195,71 @@ void fp4_batched_quantize(Tensor self, Tensor globalScale, Tensor valueE2M1, Ten
 #undef LAUNCH_FP4_QUANTIZE_KERNEL
 }
 
+std::tuple<at::Tensor, at::Tensor> silu_and_mul_fp4_batched_quantize(at::Tensor const& self,
+                                                                     at::Tensor const& mask,
+                                                                     at::Tensor const& globalScale,
+                                                                     int64_t sfVecSize) {
+  // TODO(shuw): mask can be none
+  CHECK_TH_CUDA(self);
+  CHECK_CONTIGUOUS(self);
+  CHECK_INPUT_TYPE(globalScale, c10::ScalarType::Float);
+  TORCH_CHECK(sfVecSize == 16, "sfVecSize can only be 16");
+
+  auto const& inputShape = self.sizes();
+  auto const& rank = inputShape.size();
+  auto const& mask_rank = mask.sizes().size();
+
+  TORCH_CHECK(rank == 3, "Input should be 3D tensor.");
+  TORCH_CHECK(mask_rank == 1, "Mask should be 1D tensor.");
+
+  int64_t b = inputShape[0];
+  int64_t m = inputShape[1];
+  int64_t k_by_2 = inputShape[2];
+  int64_t k = k_by_2 / 2;
+
+  TORCH_CHECK(k % sfVecSize == 0);
+  TORCH_CHECK(mask.sizes()[0] == b);
+
+  std::vector<int64_t> outputShape(inputShape.begin(), inputShape.end());
+  outputShape[rank - 1] = k / 2;
+
+  at::Tensor valueE2M1 =
+      at::detail::empty_cuda(outputShape, FLOAT4_E2M1X2, self.device(), /* stride */ std::nullopt);
+  at::Tensor scaleFP8SF =
+      at::detail::empty_cuda({b, tensorrt_llm::computeSwizzledLayoutSFSize(m, k / sfVecSize)},
+                             SF_DTYPE, self.device(), /* stride */ std::nullopt);  // 2D tensor
+
+  const thread_local int mMultiProcessorCount = tensorrt_llm::common::getMultiProcessorCount();
+  auto layout = tensorrt_llm::QuantizationSFLayout::SWIZZLED_128x4;
+
+#define LAUNCH_SILU_AND_MUL_FP4_QUANTIZE_KERNEL(T, SF_VEC_SIZE)                           \
+  tensorrt_llm::kernels::invokeSiluAndMulFP4Quantization<T, SF_VEC_SIZE>(                 \
+      b, m, k_by_2, reinterpret_cast<T*>(self.data_ptr()), globalScale.data_ptr<float>(), \
+      mask.data_ptr<int32_t>(), reinterpret_cast<int64_t*>(valueE2M1.data_ptr()),         \
+      reinterpret_cast<int32_t*>(scaleFP8SF.data_ptr()), layout, mMultiProcessorCount,    \
+      at::cuda::getCurrentCUDAStream(self.get_device()));
+
+  if (self.scalar_type() == at::ScalarType::Half) {
+    LAUNCH_SILU_AND_MUL_FP4_QUANTIZE_KERNEL(half, 16)
+  } else if (self.scalar_type() == at::ScalarType::BFloat16) {
+#ifdef ENABLE_BF16
+    LAUNCH_SILU_AND_MUL_FP4_QUANTIZE_KERNEL(__nv_bfloat16, 16)
+#else
+    C10_THROW_ERROR(NotImplementedError,
+                    "BFloat16 must be enabled to quantize an bf16 tensor to fp4.");
+#endif
+  } else {
+    C10_THROW_ERROR(NotImplementedError,
+                    "fp4_quantize only supports input tensor with dtypes fp16/bf16.");
+  }
+
+#undef LAUNCH_SILU_AND_MUL_FP4_QUANTIZE_KERNEL
+
+  return {valueE2M1, scaleFP8SF};
+}
+
+}  // namespace torch_ext
+
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(fp4_quantize, fp4_quantize);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(fp4_batched_quantize, fp4_batched_quantize);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(silu_and_mul_fp4_batched_quantize, silu_and_mul_fp4_batched_quantize);

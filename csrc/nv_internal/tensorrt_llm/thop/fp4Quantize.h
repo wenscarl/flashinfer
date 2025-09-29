@@ -31,5 +31,7 @@ void fp4_quantize(Tensor self, Optional<Tensor> const& globalScale, Tensor value
                   Tensor scaleFP8SF, int64_t sfVecSize, bool sfUseUE8M0, bool isSfSwizzledLayout,
                   bool isSf8x4Layout, bool enable_pdl);
 
-void fp4_batched_quantize(Tensor self, Tensor globalScale, Tensor valueE2M1, Tensor scaleFP8SF,
+void fp4_batched_quantize(Tensor self, 
+                          std::optional<Tensor> const& mask,
+                          Tensor globalScale, Tensor valueE2M1, Tensor scaleFP8SF,
                           int64_t sfVecSize, bool sfUseUE8M0);
