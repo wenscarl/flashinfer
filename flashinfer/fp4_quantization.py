@@ -418,12 +418,26 @@ def get_fp4_quantization_module(backend: str = "100"):
             rounds (K / sf_vec_size) up to a multiple of 4 for storage.
             - The batch dimension B is preserved for both outputs.
         """
-        return module.silu_and_mul_fp4_batched_quantize(
+        b, m, k = input.shape
+        out_val = torch.empty(
+            (b, m, k // 4),
+            dtype=torch.uint8,
+            device=input.device,
+        )
+        out_sf = torch.empty(
+            (b, _compute_swizzled_layout_sf_size(m, k // (2 * sf_vec_size), 128)),
+            dtype=torch.uint8,
+            device=input.device,
+        )
+        module.silu_and_mul_fp4_batched_quantize(
             input,
             mask,
             global_scale,
+            out_val,
+            out_sf,
             sf_vec_size,
         )
+        return out_val, out_sf
 
     @register_fake_op("flashinfer::silu_and_mul_fp4_batched_quantize_sm100")
     def _silu_and_mul_fp4_batched_quantize_sm100(
@@ -436,7 +450,7 @@ def get_fp4_quantization_module(backend: str = "100"):
         return (
             input.new_empty([b, m, k // 4], dtype=torch.int64),  # float4_e2m1_x2
             input.new_empty(
-                [b, m * k // sf_vec_size], dtype=torch.int32
+                [b, m * k // (2 * sf_vec_size)], dtype=torch.int32
             ),  # Scale factors
         )
 
@@ -846,3 +860,4 @@ def nvfp4_batched_quantize(
         False,
     )
     return a_fp4, a_sf
+
