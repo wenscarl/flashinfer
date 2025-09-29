@@ -72,7 +72,7 @@ void fp4_quantize(Tensor self, Optional<Tensor> const& globalScale, Tensor value
   tensorrt_llm::kernels::invokeFP4Quantization<T, SF_VEC_SIZE>(                                  \
       1, m, k, reinterpret_cast<T*>(self->data), globalScalePtr,                                 \
       reinterpret_cast<int64_t*>(valueE2M1->data), reinterpret_cast<int32_t*>(scaleFP8SF->data), \
-      sfUseUE8M0, layout, mMultiProcessorCount, enable_pdl, /*mask=*/nullptr,                    \
+      sfUseUE8M0, layout, mMultiProcessorCount,  /*mask=*/nullptr, enable_pdl,                    \
       get_stream(self->device));
 
   if (sfUseUE8M0) {
@@ -168,7 +168,7 @@ void fp4_batched_quantize(Tensor self, std::optional<Tensor> const& mask, Tensor
       b, m, k, reinterpret_cast<T*>(self->data), static_cast<float*>(globalScale->data),           \
       reinterpret_cast<int64_t*>(valueE2M1->data), reinterpret_cast<int32_t*>(scaleFP8SF->data),   \
       sfUseUE8M0, layout, mMultiProcessorCount, \
-      use_mask ? mask.value().data_ptr<int32_t>() : nullptr,                                       \
+      use_mask ? mask.value().data_ptr<int32_t>() : nullptr, /*enable_pdl=*/false,                                      \
       get_stream(self->device));
 
   if (self->dtype == dl_float16) {
