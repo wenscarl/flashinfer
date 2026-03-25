@@ -1646,7 +1646,7 @@ Array<Tensor> trtllm_bf16_moe(Optional<TensorView> const& routing_logits,
                               Optional<double> routed_scaling_factor, int64_t routing_method_type,
                               bool use_shuffled_weight, int64_t weight_layout, bool do_finalize,
                               bool enable_pdl, Array<int64_t> moe_tactic,
-                              bool norm_topk_prob = true) {
+                              bool norm_topk_prob) {
   // Just some basic type validation first and leave more checks to the launcher
   if (routing_logits.has_value()) {
     TVM_FFI_ICHECK(routing_logits.value().dtype() == dl_float32 ||
@@ -1725,7 +1725,7 @@ Array<Tensor> trtllm_fp8_per_tensor_scale_moe(
     int64_t local_expert_offset, int64_t local_num_experts, Optional<double> routed_scaling_factor,
     bool use_routing_scales_on_input, int64_t routing_method_type, bool do_finalize,
     bool enable_pdl, Array<int64_t> config_index, int64_t activation_type,
-    bool norm_topk_prob = true) {
+    bool norm_topk_prob) {
   // Basic type validation
   auto dtype = hidden_states.dtype();
   auto activation = static_cast<ActivationType>(activation_type);
@@ -1818,7 +1818,7 @@ Array<Tensor> trtllm_fp8_block_scale_moe(
     int64_t local_expert_offset, int64_t local_num_experts, Optional<double> routed_scaling_factor,
     int64_t routing_method_type, bool use_shuffled_weight, int64_t weight_layout, bool do_finalize,
     bool enable_pdl, Array<int64_t> config_index, Fp8QuantizationType quantization_type,
-    bool norm_topk_prob = true) {
+    bool norm_topk_prob) {
   // Basic type validation
   auto dtype = hidden_states.dtype();
 
@@ -1946,7 +1946,7 @@ Array<Tensor> trtllm_fp4_block_scale_moe(
     Optional<int64_t> n_group, Optional<int64_t> topk_group, int64_t intermediate_size,
     int64_t local_expert_offset, int64_t local_num_experts, Optional<double> routed_scaling_factor,
     int64_t routing_method_type, bool do_finalize, bool enable_pdl, int64_t act_type,
-    TensorView output, Array<int64_t> config_index, bool norm_topk_prob = true) {
+    TensorView output, Array<int64_t> config_index, bool norm_topk_prob) {
   // Determine data types based on input format
   int const num_tokens = hidden_states.size(0);
   int hidden_size = hidden_states.size(1);
@@ -2084,7 +2084,7 @@ Array<Tensor> trtllm_mxint4_block_scale_moe(
     Optional<int64_t> n_group, Optional<int64_t> topk_group, int64_t intermediate_size,
     int64_t local_expert_offset, int64_t local_num_experts, Optional<double> routed_scaling_factor,
     int64_t routing_method_type, bool do_finalize, bool enable_pdl, TensorView output,
-    Array<int64_t> config_index, bool norm_topk_prob = true) {
+    Array<int64_t> config_index, bool norm_topk_prob) {
   // Determine data types based on input format
   int const num_tokens = hidden_states.size(0);
   int hidden_size = hidden_states.size(1);

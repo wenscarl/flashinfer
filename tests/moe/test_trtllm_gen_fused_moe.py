@@ -1795,6 +1795,25 @@ def routing_reference_renormalize_naive(expert_logits, top_k, num_experts, paddi
     return permute_info, scores
 
 
+def routing_reference_sigmoid_renorm(expert_logits, top_k, num_experts, padding):
+    """Sigmoid->TopK -> SumNormalize routing reference (SigmoidRenorm path)."""
+    scores = torch.sigmoid(expert_logits.float())
+    topk_values, topk_idx = torch.topk(scores, k=top_k, dim=-1)
+    # norm_topk_prob=True: divide selected scores by their sum
+    topk_values = topk_values / topk_values.sum(dim=-1, keepdim=True)
+    topk_values = topk_values.to(expert_logits.dtype)
+
+    new_mask = torch.zeros_like(expert_logits)
+    new_mask.scatter_(-1, topk_idx, 1)
+    scores = expert_logits * new_mask
+
+    for i in range(topk_idx.shape[0]):
+        for j in range(topk_idx.shape[1]):
+            scores[i, topk_idx[i, j]] = topk_values[i, j]
+    permute_info = routing_reference(scores, top_k, padding)
+    return permute_info, scores
+
+
 def routing_reference_topk(expert_logits, top_k, num_experts, padding):
     """TopK only (no softmax) routing reference."""
     topk_values, topk_idx = torch.topk(expert_logits, k=top_k, dim=-1)
@@ -2675,6 +2694,10 @@ def run_moe_test(
         permute_info, scores = routing_reference_renormalize_naive(
             expert_logits, top_k, num_experts, padding
         )
+    elif routing_method_type == RoutingMethodType.SigmoidRenorm:
+        permute_info, scores = routing_reference_sigmoid_renorm(
+            expert_logits, top_k, num_experts, padding
+        )
     elif routing_method_type == RoutingMethodType.TopK:
         permute_info, scores = routing_reference_topk(
             expert_logits, top_k, num_experts, padding
@@ -3267,6 +3290,106 @@ def test_llama4_routing(
     cache_permute_indices,
 ):
     """Test Llama4 routing configuration with FP8 per-tensor."""
+    run_moe_test(
+        num_tokens,
+        hidden_size,
+        intermediate_size,
+        moe_impl,
+        routing_config,
+        weight_processing,
+        activation_type,
+        cache_permute_indices,
+    )
+
+
+# Test: SigmoidRenorm routing (Sigmoid->TopK->SumNormalize)
+@pytest.mark.parametrize("num_tokens", [8, 768, 3072])
+@pytest.mark.parametrize("hidden_size", [1024])
+@pytest.mark.parametrize("intermediate_size", [1024, 768, 512, 384])
+@pytest.mark.parametrize(
+    "moe_impl",
+    [
+        pytest.param(BF16Moe(), id="BF16xBF16"),
+        pytest.param(FP8PerTensorMoe(), id="FP8_Tensor"),
+        pytest.param(FP4Moe(quant_mode=QuantMode.FP4_NVFP4_NVFP4), id="NvFP4xNvFP4"),
+    ],
+)
+@pytest.mark.parametrize(
+    "routing_config",
+    [
+        pytest.param(
+            {
+                "num_experts": 128,
+                "top_k": 8,
+                "padding": 8,
+                "n_groups": None,
+                "top_k_groups": None,
+                "routed_scaling": None,
+                "has_routing_bias": False,
+                "routing_method_type": RoutingMethodType.SigmoidRenorm,
+                "compatible_moe_impls": [BF16Moe, FP8PerTensorMoe, FP4Moe],
+                "compatible_intermediate_size": [384, 512, 768, 1024],
+                "enable_autotune": True,
+            },
+            id="SigmoidRenorm_128E_top8",
+        ),
+        pytest.param(
+            {
+                "num_experts": 64,
+                "top_k": 2,
+                "padding": 8,
+                "n_groups": None,
+                "top_k_groups": None,
+                "routed_scaling": None,
+                "has_routing_bias": False,
+                "routing_method_type": RoutingMethodType.SigmoidRenorm,
+                "compatible_moe_impls": [BF16Moe, FP8PerTensorMoe, FP4Moe],
+                "compatible_intermediate_size": [384, 512, 768, 1024],
+                "enable_autotune": True,
+            },
+            id="SigmoidRenorm_64E_top2",
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    "weight_processing",
+    [
+        pytest.param(
+            {
+                "use_shuffled_weight": True,
+                "layout": WeightLayout.BlockMajorK,
+                "compatible_moe_impls": [
+                    FP8BlockScaleMoe,
+                    BF16Moe,
+                    MxInt4BlockScaleMoe,
+                ],
+            },
+            id="Shuffled_BlockMajorK",
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    "activation_type",
+    [
+        pytest.param(ActivationType.Swiglu.value, id="Swiglu"),
+    ],
+)
+def test_sigmoid_renorm_routing(
+    num_tokens,
+    hidden_size,
+    intermediate_size,
+    moe_impl,
+    routing_config,
+    weight_processing,
+    activation_type,
+    cache_permute_indices,
+):
+    """Test SigmoidRenorm routing: sigmoid activation on logits, top-K selection,
+    then division by the sum of selected scores (norm_topk_prob=True).
+
+    This verifies the fix for bug #2732 where SigmoidRenorm was missing from the
+    routingRenormalize dispatch and the logits dtype was hardcoded to fp32.
+    """
     run_moe_test(
         num_tokens,
         hidden_size,

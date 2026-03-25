@@ -146,6 +146,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     //
 
     routingData.mDtypeExpW = btg::Dtype::Bfloat16;
+    routingData.mDtypeScore = dtypeLogits;  // Bug B fix: respect caller's logit dtype (bf16 or fp32)
     // routingData.mDtypeElt = dtypeElt; // no-op for now as hidden_state is not input
     routingData.mUsePdl = true;
 
