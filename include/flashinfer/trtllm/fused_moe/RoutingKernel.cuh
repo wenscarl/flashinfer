@@ -249,7 +249,12 @@ __device__ void routingPermutation(KernelParams params,
   // for each of these, we keep the associated expert and offset within expert in registers
   int32_t expertIndexes[MaxExpandedIdxPerThread];
   int32_t expertOffsets[MaxExpandedIdxPerThread];
-  auto localExpertExtent = params.mNumLocalExperts << params.mLocalExpertsStrideLog2;
+  // Routed-only extent. mNumLocalExperts was bumped to include the fused shared expert,
+  // but for the routed-expert locality check we must exclude it; otherwise rank k's
+  // window incorrectly includes rank k+1's first expert (off-by-one collision with
+  // the shared-expert slot).
+  auto localExpertExtent = (params.mNumLocalExperts - params.mNumFusedSharedExperts)
+                           << params.mLocalExpertsStrideLog2;
 
   // Define a lambda to avoid code duplication in both branches.
   auto loopBody = [&](int ii, int expandedIdx) {
@@ -532,7 +537,10 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelPa
 #endif  // if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
 
   uint32_t const expandedIdxSize = params.mNumTokens * params.mTopK;
-  uint32_t const localExpertExtent = params.mNumLocalExperts << params.mLocalExpertsStrideLog2;
+  // Routed-only extent (see comment in routingPermutation): exclude fused shared experts
+  // so rank k's locality window does not bleed into rank k+1's first expert.
+  uint32_t const localExpertExtent =
+      (params.mNumLocalExperts - params.mNumFusedSharedExperts) << params.mLocalExpertsStrideLog2;
 
   // Use NumThreadsBlock (actual thread count) for grid-stride addressing
   uint32_t const gridBlockOffset = blockIdx.x * NumThreadsBlock;
@@ -758,7 +766,10 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelPa
     // for each of these, we keep the associated expert and offset within expert in registers
     int32_t expertIndexes[MaxExpandedIdxPerThread];
     int32_t expertOffsets[MaxExpandedIdxPerThread];
-    auto localExpertExtent = params.mNumLocalExperts << params.mLocalExpertsStrideLog2;
+    // Routed-only extent (see comment in routingPermutation): exclude fused shared experts
+    // so rank k's locality window does not bleed into rank k+1's first expert.
+    auto localExpertExtent = (params.mNumLocalExperts - params.mNumFusedSharedExperts)
+                             << params.mLocalExpertsStrideLog2;
 
     // Define a lambda to avoid code duplication in branches.
     auto loopBody = [&](int ii, int expandedIdx) {
@@ -988,7 +999,10 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts)
   // for each of these, we keep the associated expert and offset within expert in registers
   int32_t expertIndexes[MaxExpandedIdxPerThread];
   int32_t expertOffsets[MaxExpandedIdxPerThread];
-  auto localExpertExtent = params.mNumLocalExperts << params.mLocalExpertsStrideLog2;
+  // Routed-only extent (see comment in routingPermutation): exclude fused shared experts
+  // so rank k's locality window does not bleed into rank k+1's first expert.
+  auto localExpertExtent = (params.mNumLocalExperts - params.mNumFusedSharedExperts)
+                           << params.mLocalExpertsStrideLog2;
   int constexpr IterStride = 4;
   static_assert(MaxExpandedIdxPerThread % IterStride == 0);
 
