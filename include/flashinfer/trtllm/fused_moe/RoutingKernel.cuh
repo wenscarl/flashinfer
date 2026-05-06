@@ -270,9 +270,20 @@ __device__ void routingPermutation(KernelParams params,
 
     expertIndexes[ii] = scoreIdx.idx;
     // check whether this expert is local to our GPU at all and ignore if not
-    auto localExpertIdx = scoreIdx.idx - params.mLocalExpertsStartIdx;
-    auto isLocalExpert = localExpertIdx >= 0 && localExpertIdx < localExpertExtent &&
-                         (localExpertIdx & ((1 << params.mLocalExpertsStrideLog2) - 1)) == 0;
+    // Fused shared experts (index >= num_routed_experts) are replicated on all EP ranks;
+    // each rank handles only its assigned token partition [offset, offset+count).
+    int32_t const numRoutedExperts_c = params.mNumExperts - params.mNumFusedSharedExperts;
+    bool const isShared_c = params.mNumFusedSharedExperts > 0 && scoreIdx.idx >= numRoutedExperts_c;
+    bool isLocalExpert;
+    if (isShared_c) {
+      int32_t const tokenIdx_c = expandedIdx / params.mTopK;
+      isLocalExpert = tokenIdx_c >= params.mSharedExpertTokenOffset &&
+                      tokenIdx_c < params.mSharedExpertTokenOffset + params.mSharedExpertNumTokens;
+    } else {
+      auto localExpertIdx = scoreIdx.idx - params.mLocalExpertsStartIdx;
+      isLocalExpert = localExpertIdx >= 0 && localExpertIdx < localExpertExtent &&
+                      (localExpertIdx & ((1 << params.mLocalExpertsStrideLog2) - 1)) == 0;
+    }
     expertOffsets[ii] = isLocalExpert ? atomicAdd(smemExpertCount + scoreIdx.idx, 1) : 0;
     if (params.mPtrTopKWeights != nullptr && params.mPtrTopKIds == nullptr) {
       params.mPtrTopKWeights[expandedIdx] = OutputT{scoreIdx.score};
@@ -373,8 +384,12 @@ __device__ void routingPermutation(KernelParams params,
     if (expert < params.mNumExperts) {
       // Strided loop to share this work between blocks.
       for (int32_t cta = clusterBlockRank; cta < numCta[e]; cta += NumBlocksPerCluster) {
-        const int32_t localExpertIdx =
-            (expert - params.mLocalExpertsStartIdx) >> params.mLocalExpertsStrideLog2;
+        // Fused shared experts map to local slot (numLocalRoutedExperts + sharedOffset) on all ranks.
+        int32_t const numRoutedExperts_cl = params.mNumExperts - params.mNumFusedSharedExperts;
+        int32_t const localExpertIdx =
+            (params.mNumFusedSharedExperts > 0 && expert >= numRoutedExperts_cl)
+            ? ((params.mNumLocalExperts - params.mNumFusedSharedExperts) + (expert - numRoutedExperts_cl))
+            : ((expert - params.mLocalExpertsStartIdx) >> params.mLocalExpertsStrideLog2);
         params.mPtrCtaIdxXyToBatchIdx[ctaOffset[e] + cta] = localExpertIdx;
         // Write CTA-level MnLimits using ctaTile = cgaTile / clusterSize
         int32_t mnLimit1;
@@ -433,11 +448,19 @@ __device__ void routingPermutation(KernelParams params,
       break;
     }
     auto expertIdx = expertIndexes[ii];
-    // check whether this expert is local to our GPU at all
-    auto localExpertIdx = static_cast<int32_t>(expertIdx) - params.mLocalExpertsStartIdx;
-    auto isLocalExpert = localExpertIdx >= 0 && localExpertIdx < localExpertExtent &&
-                         (localExpertIdx & ((1 << params.mLocalExpertsStrideLog2) - 1)) == 0;
     auto tokenIdx = expandedIdx / params.mTopK;
+    // check whether this expert is local to our GPU at all
+    int32_t const numRoutedExperts_c2 = params.mNumExperts - params.mNumFusedSharedExperts;
+    bool const isShared_c2 = params.mNumFusedSharedExperts > 0 && expertIdx >= numRoutedExperts_c2;
+    bool isLocalExpert;
+    if (isShared_c2) {
+      isLocalExpert = tokenIdx >= params.mSharedExpertTokenOffset &&
+                      tokenIdx < params.mSharedExpertTokenOffset + params.mSharedExpertNumTokens;
+    } else {
+      auto localExpertIdx = static_cast<int32_t>(expertIdx) - params.mLocalExpertsStartIdx;
+      isLocalExpert = localExpertIdx >= 0 && localExpertIdx < localExpertExtent &&
+                      (localExpertIdx & ((1 << params.mLocalExpertsStrideLog2) - 1)) == 0;
+    }
     auto permutedIdx =
         isLocalExpert ? int32_t{smemExpertOffset[expertIdx]} + expertOffsets[ii] : int32_t{-1};
     if (params.mPtrExpandedIdxToPermutedIdx != nullptr) {
@@ -530,9 +553,18 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelPa
       }
     }
     // check whether this expert is local to our GPU at all and ignore if not
-    auto localExpertIdx = idx - params.mLocalExpertsStartIdx;
-    auto isLocalExpert = localExpertIdx >= 0 && localExpertIdx < localExpertExtent &&
-                         (localExpertIdx & ((1 << params.mLocalExpertsStrideLog2) - 1)) == 0;
+    int32_t const numRoutedExperts_m = params.mNumExperts - params.mNumFusedSharedExperts;
+    bool const isShared_m = params.mNumFusedSharedExperts > 0 && idx >= numRoutedExperts_m;
+    bool isLocalExpert;
+    if (isShared_m) {
+      int32_t const tokenIdx_m = expandedIdx / params.mTopK;
+      isLocalExpert = tokenIdx_m >= params.mSharedExpertTokenOffset &&
+                      tokenIdx_m < params.mSharedExpertTokenOffset + params.mSharedExpertNumTokens;
+    } else {
+      auto localExpertIdx = idx - params.mLocalExpertsStartIdx;
+      isLocalExpert = localExpertIdx >= 0 && localExpertIdx < localExpertExtent &&
+                      (localExpertIdx & ((1 << params.mLocalExpertsStrideLog2) - 1)) == 0;
+    }
     if (isLocalExpert) {
       atomicAdd(&smemExpertCount[idx], 1);
     }
@@ -679,8 +711,12 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelPa
     if (expert < params.mNumExperts) {
       // Strided loop to share this work between blocks.
       for (int32_t cta = blockIdx.x; cta < numCta[e]; cta += gridDim.x) {
-        const int32_t localExpertIdx =
-            (expert - params.mLocalExpertsStartIdx) >> params.mLocalExpertsStrideLog2;
+        // Fused shared experts map to local slot (numLocalRoutedExperts + sharedOffset) on all ranks.
+        int32_t const numRoutedExperts_ml = params.mNumExperts - params.mNumFusedSharedExperts;
+        int32_t const localExpertIdx =
+            (params.mNumFusedSharedExperts > 0 && expert >= numRoutedExperts_ml)
+            ? ((params.mNumLocalExperts - params.mNumFusedSharedExperts) + (expert - numRoutedExperts_ml))
+            : ((expert - params.mLocalExpertsStartIdx) >> params.mLocalExpertsStrideLog2);
         params.mPtrCtaIdxXyToBatchIdx[ctaOffset[e] + cta] = localExpertIdx;
         // Write CTA-level MnLimits using ctaTile = cgaTile / clusterSize
         int32_t mnLimit1;
@@ -729,9 +765,18 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelPa
       expertIndexes[ii] = params.mPtrTopKIds ? params.mPtrTopKIds[expandedIdx]
                                              : params.mPtrTopKPacked[expandedIdx].idx;
       // check whether this expert is local to our GPU at all and ignore if not
-      auto localExpertIdx = expertIndexes[ii] - params.mLocalExpertsStartIdx;
-      auto isLocalExpert = localExpertIdx >= 0 && localExpertIdx < localExpertExtent &&
-                           (localExpertIdx & ((1 << params.mLocalExpertsStrideLog2) - 1)) == 0;
+      int32_t const numRoutedExperts_ml2 = params.mNumExperts - params.mNumFusedSharedExperts;
+      bool const isShared_ml2 = params.mNumFusedSharedExperts > 0 && expertIndexes[ii] >= numRoutedExperts_ml2;
+      bool isLocalExpert;
+      if (isShared_ml2) {
+        int32_t const tokenIdx_ml2 = expandedIdx / params.mTopK;
+        isLocalExpert = tokenIdx_ml2 >= params.mSharedExpertTokenOffset &&
+                        tokenIdx_ml2 < params.mSharedExpertTokenOffset + params.mSharedExpertNumTokens;
+      } else {
+        auto localExpertIdx = expertIndexes[ii] - params.mLocalExpertsStartIdx;
+        isLocalExpert = localExpertIdx >= 0 && localExpertIdx < localExpertExtent &&
+                        (localExpertIdx & ((1 << params.mLocalExpertsStrideLog2) - 1)) == 0;
+      }
       expertOffsets[ii] = isLocalExpert ? atomicAdd(smemExpertCount + expertIndexes[ii], 1) : 0;
     };
 
@@ -805,11 +850,19 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelPa
     // Add tile offset and element offset and write to global memory.
     auto storeLoopBody = [&](int ii, int expandedIdx) {
       int32_t expertIdx = expertIndexes[ii];
-      // check whether this expert is local to our GPU at all
-      auto localExpertIdx = static_cast<int32_t>(expertIdx) - params.mLocalExpertsStartIdx;
-      auto isLocalExpert = localExpertIdx >= 0 && localExpertIdx < localExpertExtent &&
-                           (localExpertIdx & ((1 << params.mLocalExpertsStrideLog2) - 1)) == 0;
       auto tokenIdx = expandedIdx / params.mTopK;
+      // check whether this expert is local to our GPU at all
+      int32_t const numRoutedExperts_ms = params.mNumExperts - params.mNumFusedSharedExperts;
+      bool const isShared_ms = params.mNumFusedSharedExperts > 0 && expertIdx >= numRoutedExperts_ms;
+      bool isLocalExpert;
+      if (isShared_ms) {
+        isLocalExpert = tokenIdx >= params.mSharedExpertTokenOffset &&
+                        tokenIdx < params.mSharedExpertTokenOffset + params.mSharedExpertNumTokens;
+      } else {
+        auto localExpertIdx = static_cast<int32_t>(expertIdx) - params.mLocalExpertsStartIdx;
+        isLocalExpert = localExpertIdx >= 0 && localExpertIdx < localExpertExtent &&
+                        (localExpertIdx & ((1 << params.mLocalExpertsStrideLog2) - 1)) == 0;
+      }
       auto permutedIdx =
           isLocalExpert ? (expertOffsets[ii] + smemExpertTileOffset[expertIdx]) : int32_t{-1};
       if (params.mPtrExpandedIdxToPermutedIdx != nullptr) {
