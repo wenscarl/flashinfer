@@ -999,9 +999,18 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts)
         getExpertIdxFromInputWithWeights(params, expandedIdx, params.mPtrTopKWeights);
     expertIndexes[ii] = expertIdx;
     // check whether this expert is local to our GPU at all and ignore if not
-    auto localExpertIdx = expertIdx - params.mLocalExpertsStartIdx;
-    auto isLocalExpert = localExpertIdx >= 0 && localExpertIdx < localExpertExtent &&
-                         (localExpertIdx & ((1 << params.mLocalExpertsStrideLog2) - 1)) == 0;
+    int32_t const numRoutedExperts_ck = params.mNumExperts - params.mNumFusedSharedExperts;
+    bool const isShared_ck = params.mNumFusedSharedExperts > 0 && expertIdx >= numRoutedExperts_ck;
+    bool isLocalExpert;
+    if (isShared_ck) {
+      int32_t const tokenIdx_ck = expandedIdx / params.mTopK;
+      isLocalExpert = tokenIdx_ck >= params.mSharedExpertTokenOffset &&
+                      tokenIdx_ck < params.mSharedExpertTokenOffset + params.mSharedExpertNumTokens;
+    } else {
+      auto localExpertIdx = expertIdx - params.mLocalExpertsStartIdx;
+      isLocalExpert = localExpertIdx >= 0 && localExpertIdx < localExpertExtent &&
+                      (localExpertIdx & ((1 << params.mLocalExpertsStrideLog2) - 1)) == 0;
+    }
     expertOffsets[ii] = isLocalExpert ? atomicAdd(smemExpertCount + expertIdx, 1) : 0;
   };
 
@@ -1066,8 +1075,12 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts)
   Scan(tempStorage).ExclusiveSum(numCta, ctaOffset, numNonExitingCtas);
 
   for (int32_t cta = gridBlockIdx; cta < numCta; cta += numBlocks) {
-    const int32_t localExpertIdx =
-        (threadIdx.x - params.mLocalExpertsStartIdx) >> params.mLocalExpertsStrideLog2;
+    // Fused shared experts map to local slot (numLocalRoutedExperts + sharedOffset) on all ranks.
+    int32_t const numRoutedExperts_ck2 = params.mNumExperts - params.mNumFusedSharedExperts;
+    int32_t const localExpertIdx =
+        (params.mNumFusedSharedExperts > 0 && threadIdx.x >= numRoutedExperts_ck2)
+        ? ((params.mNumLocalExperts - params.mNumFusedSharedExperts) + (threadIdx.x - numRoutedExperts_ck2))
+        : ((threadIdx.x - params.mLocalExpertsStartIdx) >> params.mLocalExpertsStrideLog2);
     params.mPtrCtaIdxXyToBatchIdx[ctaOffset + cta] = localExpertIdx;
     // Write CTA-level MnLimits using ctaTile = cgaTile / clusterSize
     int32_t mnLimit1;
@@ -1116,11 +1129,19 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts)
       break;
     }
     auto expertIdx = expertIndexes[ii];
-    // check whether this expert is local to our GPU at all
-    auto localExpertIdx = static_cast<int32_t>(expertIdx) - params.mLocalExpertsStartIdx;
-    auto isLocalExpert = localExpertIdx >= 0 && localExpertIdx < localExpertExtent &&
-                         (localExpertIdx & ((1 << params.mLocalExpertsStrideLog2) - 1)) == 0;
     auto tokenIdx = expandedIdx / params.mTopK;
+    // check whether this expert is local to our GPU at all
+    int32_t const numRoutedExperts_ck3 = params.mNumExperts - params.mNumFusedSharedExperts;
+    bool const isShared_ck3 = params.mNumFusedSharedExperts > 0 && expertIdx >= numRoutedExperts_ck3;
+    bool isLocalExpert;
+    if (isShared_ck3) {
+      isLocalExpert = tokenIdx >= params.mSharedExpertTokenOffset &&
+                      tokenIdx < params.mSharedExpertTokenOffset + params.mSharedExpertNumTokens;
+    } else {
+      auto localExpertIdx = static_cast<int32_t>(expertIdx) - params.mLocalExpertsStartIdx;
+      isLocalExpert = localExpertIdx >= 0 && localExpertIdx < localExpertExtent &&
+                      (localExpertIdx & ((1 << params.mLocalExpertsStrideLog2) - 1)) == 0;
+    }
     auto permutedIdx =
         isLocalExpert ? int32_t{smemExpertOffset[expertIdx]} + expertOffsets[ii] : int32_t{-1};
     if (params.mPtrExpandedIdxToPermutedIdx != nullptr) {
